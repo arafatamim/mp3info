@@ -1,0 +1,9 @@
+[package]
+name = "mp3info"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+atty = "0.2.14"
+clap = { version = "4.0.27", features = ["derive"] }
+encoding = "0.2.33"
