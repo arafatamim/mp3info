@@ -4,7 +4,7 @@
 
 ## Install
 ```sh
-cargo install --root=$HOME/.local/ --path .
+cargo install --root=$HOME/.local/ --git https://github.com/arafatamim/mp3info
 ```
 
 ## Usage
