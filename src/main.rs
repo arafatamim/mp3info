@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::{
     error::Error,
-    fmt, fs,
+    fmt::{self},
+    fs,
     io::{Read, Write},
 };
 
@@ -40,14 +41,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Display commonly used song metadata
-    Info { path: String },
+    Info {
+        path: String,
+    },
     /// View song lyrics
-    Lyrics { path: String },
+    Lyrics {
+        path: String,
+    },
     /// Emit picture as binary data
     Picture {
         path: String,
         #[arg(long, short = 't', default_value_t = PictureType::CoverFront, value_enum)]
         picture_type: PictureType,
+        #[arg(short = 'l', long, default_value = "false")]
+        list: bool,
     },
 }
 
@@ -56,25 +63,27 @@ fn read_file(path: &str) -> Result<Tag, Box<dyn Error>> {
 
     let tag_headers = {
         let mut tag_headers = [0; 10];
-        file.read(&mut tag_headers)?;
+        file.read_exact(&mut tag_headers)?;
         tag_headers
     };
 
     let header = decode_header(tag_headers)?;
 
     if header.extended {
-        return Err(AppError::new(
-            "Doesn't yet support decoding extended header",
-        ));
+        let extended_header_size = consume_bytes(&mut file, 4)?;
+        let extended_header_size = byte_int(&extended_header_size);
+
+        let mut extended_header_data = vec![0; extended_header_size as usize - 4]; // minus 4 bytes for the size field
+        file.read_exact(&mut extended_header_data)?; // consume extended header data
     }
 
     let tag_frames = {
         let mut tag_frames = vec![0; header.size as usize];
-        file.read(&mut tag_frames)?;
+        file.read_exact(&mut tag_frames)?;
         tag_frames
     };
 
-    let frames = decode_frames(tag_frames)?;
+    let frames = decode_frames(tag_frames, header.version == 4)?;
 
     Ok(Tag { header, frames })
 }
@@ -90,7 +99,7 @@ fn find_frame_by_id<'a>(f: &'a [Frame], id: &str) -> Option<&'a Frame> {
             _ => continue,
         }
     }
-    return None;
+    None
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -127,32 +136,61 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::Lyrics { path } => {
             let tag = read_file(&path)?;
-            let mut frames_iter = tag.frames.iter();
+            let frames = tag.frames;
 
-            let lyrics = frames_iter.find(|x| match x {
-                Frame::USLT { .. } => true,
-                _ => false,
-            });
-            if let Some(lyrics) = lyrics {
-                println!("{}", lyrics);
-            } else {
-                println!("Lyrics not available");
+            if !frames.iter().any(|x| matches!(&x, Frame::Uslt { .. })) {
+                return Err(AppError::new("Lyrics not available").into());
+            }
+
+            for frame in frames {
+                match frame {
+                    Frame::Uslt {
+                        text,
+                        language,
+                        description,
+                    } => {
+                        println!("Language: {}", language);
+                        println!("Description: {}", description.trim());
+                        println!("=== \n{}", text);
+                    }
+                    _ => continue,
+                }
+                println!();
             }
         }
-        Commands::Picture { path, picture_type } => {
+        Commands::Picture {
+            path,
+            picture_type,
+            list,
+        } => {
             let tag = read_file(&path)?;
             let mut frames_iter = tag.frames.iter();
 
-            let pic = frames_iter.find(|x| match x {
-                Frame::APIC {
+            if list {
+                let pics = frames_iter.filter_map(|x| match x {
+                    Frame::Apic {
+                        picture_type: ptype,
+                        ..
+                    } => Some(ptype),
+                    _ => None,
+                });
+
+                for pic in pics {
+                    println!("{}", pic.to_possible_value().unwrap().get_name());
+                }
+                return Ok(());
+            }
+
+            let pic = frames_iter.find(|x| {
+                matches!(x, Frame::Apic {
                     picture_type: ptype,
                     ..
-                } if &picture_type == ptype => true,
-                _ => false,
+                } if &picture_type == ptype)
             });
 
             match pic {
-                Some(Frame::APIC { data, .. }) => {
+                Some(Frame::Apic { data, .. }) => {
+                    eprintln!("Picture length: {}", data.len());
                     let mut handle = std::io::stdout().lock();
                     if atty::is(atty::Stream::Stdout) {
                         println!(
@@ -161,12 +199,15 @@ fn main() -> Result<(), Box<dyn Error>> {
                     } else {
                         handle.write_all(data)?;
                     }
-                    handle.flush()?;
+                    handle.flush()?
                 }
-                _ => println!(
-                    "Attached picture type '{}' not available",
-                    picture_type.to_possible_value().unwrap().get_name()
-                ),
+                _ => {
+                    return Err(AppError::new(&format!(
+                        "Attached picture type '{}' not available",
+                        picture_type.to_possible_value().unwrap().get_name()
+                    ))
+                    .into());
+                }
             }
         }
     }

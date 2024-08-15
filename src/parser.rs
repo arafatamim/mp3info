@@ -80,12 +80,14 @@ impl TryFrom<u8> for PictureType {
 
 #[derive(Debug)]
 pub enum Frame {
-    USLT {
+    /// Unsynchronised lyrics/text transcription
+    Uslt {
         text: String,
         language: String,
         description: String,
     },
-    APIC {
+    /// Attached picture
+    Apic {
         data: Vec<u8>,
         picture_type: PictureType,
         description: String,
@@ -108,10 +110,10 @@ impl Display for Frame {
                         Content::Binary(_) => "(binary data)",
                     }
                 }
-                Frame::USLT { text, .. } => {
+                Frame::Uslt { text, .. } => {
                     text
                 }
-                Frame::APIC { .. } => "(pic)",
+                Frame::Apic { .. } => "(pic)",
             }
         )
     }
@@ -124,6 +126,7 @@ pub struct Header {
     pub unsynchronisation: bool,
     pub extended: bool,
     pub experimental: bool,
+    pub footer_present: bool,
     pub size: u32,
 }
 
@@ -134,7 +137,7 @@ pub struct Tag {
 }
 
 pub(crate) fn is_bit_set(flag: u8, index: u8) -> bool {
-    return flag & (1 << index) != 0;
+    flag & (1 << index) != 0
 }
 
 pub(crate) fn byte_int(buf: &[u8]) -> u32 {
@@ -177,10 +180,10 @@ fn consume_null_terminated_str_bytes(
 
 pub(crate) fn decode_str(buf: &[u8], encoding: Encoding) -> Result<String, Cow<'static, str>> {
     match encoding {
-        Encoding::UTF_8 => UTF_8.decode(&buf, DecoderTrap::Strict),
-        Encoding::UTF_16 => UTF_16LE.decode(&buf, DecoderTrap::Strict),
-        Encoding::UTF_16BE => UTF_16BE.decode(&buf, DecoderTrap::Strict),
-        Encoding::ISO_8859_1 => ISO_8859_1.decode(&buf, DecoderTrap::Strict),
+        Encoding::UTF_8 => UTF_8.decode(buf, DecoderTrap::Strict),
+        Encoding::UTF_16 => UTF_16LE.decode(buf, DecoderTrap::Strict),
+        Encoding::UTF_16BE => UTF_16BE.decode(buf, DecoderTrap::Strict),
+        Encoding::ISO_8859_1 => ISO_8859_1.decode(buf, DecoderTrap::Strict),
     }
 }
 
@@ -205,26 +208,6 @@ fn consume_utf16_str_bytes(buf: &mut impl Read) -> Vec<u8> {
     strbuf
 }
 
-#[cfg(test)]
-mod tests {
-    use std::io::Read;
-
-    #[test]
-    fn parse_utf16_bytes() {
-        let mut buf = std::io::Cursor::new([
-            0xff, 0xfe, 0x43, 0x00, 0x6f, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00, 0x00, 0x00,
-        ]);
-        let bytes =
-            super::consume_null_terminated_str_bytes(&mut buf, super::Encoding::UTF_16).unwrap();
-
-        assert_eq!(
-            &bytes,
-            &[0xff, 0xfe, 0x43, 0x00, 0x6f, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00, 0x00, 0x00]
-        );
-        assert!(buf.bytes().next().is_none());
-    }
-}
-
 pub(crate) fn read_text_from_buf(
     buf: &mut impl Read,
     size: usize,
@@ -242,9 +225,6 @@ pub fn decode_header(buf: [u8; 10]) -> Result<Header, Box<dyn Error>> {
     };
 
     let version = buf[3];
-    if version != 3 {
-        return Err(AppError::new("Only v3 ID3 Tags supported"));
-    }
 
     let revision = buf[4];
 
@@ -252,6 +232,7 @@ pub fn decode_header(buf: [u8; 10]) -> Result<Header, Box<dyn Error>> {
     let unsynchronisation = is_bit_set(flag, 7);
     let extended = is_bit_set(flag, 6);
     let experimental = is_bit_set(flag, 5);
+    let footer_present = is_bit_set(flag, 4);
 
     let size = byte_int_unsynch(&buf[6..10]);
 
@@ -261,42 +242,63 @@ pub fn decode_header(buf: [u8; 10]) -> Result<Header, Box<dyn Error>> {
         unsynchronisation,
         extended,
         experimental,
+        footer_present,
         size,
     };
 
     Ok(header)
 }
 
-pub fn decode_frames(buf: Vec<u8>) -> Result<Vec<Frame>, Box<dyn Error>> {
+pub fn decode_extended_header(_buf: Vec<u8>) -> Result<(), Box<dyn Error>> {
+    todo!();
+}
+
+pub fn decode_frames(buf: Vec<u8>, v4: bool) -> Result<Vec<Frame>, Box<dyn Error>> {
     let mut buf = io::Cursor::new(buf);
     let mut frames: Vec<Frame> = Vec::new();
 
     loop {
         let id = {
             let b = consume_bytes(&mut buf, 4)?;
-            String::from_utf8(b)?
+            String::from_utf8(b).unwrap_or("INVALID".into())
         };
 
         let size = {
             let b = consume_bytes(&mut buf, 4)?;
-            byte_int(&b) as usize
-        } - 1;
-
-        let _flags = {
-            let b = consume_bytes(&mut buf, 2)?;
-            b // TODO: actually parse flags
-        };
-
-        let encoding = {
-            if id != "RVAD" {
-                let b = consume_bytes(&mut buf, 1)?;
-                Encoding::try_from(b[0])?
+            if v4 {
+                byte_int_unsynch(&b) as usize
             } else {
-                Encoding::UTF_8
+                byte_int(&b) as usize
             }
         };
 
+        let _flags = consume_bytes(&mut buf, 2)?; // TODO: actually parse flags
+
+        let encoding = {
+            match id.as_str() {
+                "RVAD" | "RVA2" | "SYLT" => Encoding::UTF_8,
+                _ => {
+                    let b = consume_bytes(&mut buf, 1)?;
+                    Encoding::try_from(b[0])?
+                }
+            }
+        };
+
+        let size = if size > 0 { size - 1 } else { size }; // minus 1 byte for encoding;
+
         let frame = match id.as_str() {
+            "TXXX" => {
+                let description_bytes = consume_null_terminated_str_bytes(&mut buf, encoding)?;
+                let description = decode_str(&description_bytes, encoding)?;
+                let value = {
+                    let b = consume_bytes(&mut buf, size - description_bytes.len())?;
+                    decode_str(&b, encoding)?
+                };
+                Frame::Other {
+                    id,
+                    content: Content::Text(format!("{description}{value}")),
+                }
+            }
             "USLT" => {
                 let language = {
                     let b = consume_bytes(&mut buf, 3)?;
@@ -317,7 +319,7 @@ pub fn decode_frames(buf: Vec<u8>) -> Result<Vec<Frame>, Box<dyn Error>> {
                     decode_str(&b, encoding)?
                 };
 
-                Frame::USLT {
+                Frame::Uslt {
                     text: value,
                     language,
                     description,
@@ -370,15 +372,25 @@ pub fn decode_frames(buf: Vec<u8>) -> Result<Vec<Frame>, Box<dyn Error>> {
                         + mime_type.len() + description_bytes.len()),
                 )?;
 
-                Frame::APIC {
+                Frame::Apic {
                     data: picture,
                     description,
                     picture_type: picture_type.try_into().unwrap(), // unsafe code
                 }
             }
             "RVAD" | "RVA2" => {
-                consume_bytes(&mut buf, size + 1)?;
-                continue;
+                let b = consume_bytes(&mut buf, size + 1)?; // discard the additional byte for now
+                Frame::Other {
+                    id,
+                    content: Content::Binary(b),
+                }
+            }
+            "SYLT" => {
+                let b = consume_bytes(&mut buf, size + 1)?; // encoding not present in SYLT, so size is +1
+                Frame::Other {
+                    id,
+                    content: Content::Binary(b),
+                }
             }
             _ => {
                 let text = read_text_from_buf(&mut buf, size, encoding)?;
@@ -394,7 +406,10 @@ pub fn decode_frames(buf: Vec<u8>) -> Result<Vec<Frame>, Box<dyn Error>> {
 
         {
             let cur_pos = buf.position();
-            let bytes = consume_bytes(&mut buf, 4)?;
+            let bytes = match consume_bytes(&mut buf, 4) {
+                Ok(bytes) => bytes,
+                Err(_) => break,
+            };
             let num = byte_int(&bytes) as usize;
             if num == 0 {
                 break;
@@ -404,4 +419,24 @@ pub fn decode_frames(buf: Vec<u8>) -> Result<Vec<Frame>, Box<dyn Error>> {
     }
 
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+
+    #[test]
+    fn parse_utf16_bytes() {
+        let mut buf = std::io::Cursor::new([
+            0xff, 0xfe, 0x43, 0x00, 0x6f, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00, 0x00, 0x00,
+        ]);
+        let bytes =
+            super::consume_null_terminated_str_bytes(&mut buf, super::Encoding::UTF_16).unwrap();
+
+        assert_eq!(
+            &bytes,
+            &[0xff, 0xfe, 0x43, 0x00, 0x6f, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00, 0x00, 0x00]
+        );
+        assert!(buf.bytes().next().is_none());
+    }
 }
